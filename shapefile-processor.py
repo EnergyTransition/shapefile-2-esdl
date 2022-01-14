@@ -12,9 +12,23 @@
 #  Manager:
 #      TNO
 
+######################################################################################################################
+# TODO:
+#
+# - Add a joint and split pipe if a consumer wants to connect to a pipe segment that is not the start/end of a pipe
+# - Improve support for 2D/3D shapefiles (with and without Z coordinates)
+# - Improve importing exrta attributes from shapefiles (diameters, demand, names, ...)
+# - Handle consumer and producer connecting at same point
+# - Handle simple network without T-joints ??
+# - Check adapters that are T-joints ??
+# - ...
+#
+######################################################################################################################
+
 from osgeo import gdal      # required by Fiona
 import fiona
-from shapely.geometry import shape, Point, LineString, mapping
+from shapely.geometry import shape, Point, LineString, mapping, MultiPoint
+from shapely.ops import nearest_points
 from uuid import uuid4
 import copy
 import math
@@ -22,17 +36,47 @@ from esdl import esdl
 from esdl.esdl_handler import EnergySystemHandler
 from shape import Shape
 
-SHAPEFILE_LINES_FILENAME = "./data/example_network.shp"
-ESDL_OUTPUT_FILENAME = "./output/pipes.esdl"
-BUFFER_JOINTS_OUTPUT_FILENAME = "./output/points_buffer.shp"
-T_JOINTS_OUTPUT_FILENAME = "./output/t_joint_points.shp"
+SHAPEFILE_LINES_FILENAME = "data/simple_single_pipe/example_network.shp"
+SHAPEFILE_PRODUCERS_FILENAME = "data/simple_single_pipe/sources.shp"
+SHAPEFILE_CONSUMERS_FILENAME = "data/simple_single_pipe/consumers.shp"
+ESDL_OUTPUT_FILENAME = "output/simple_single_pipe/pipes.esdl"
+BUFFER_JOINTS_OUTPUT_FILENAME = "output/simple_single_pipe/points_buffer.shp"
+BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME = "output/simple_single_pipe/producers_consumers_buffer.shp"
+T_JOINTS_OUTPUT_FILENAME = "output/simple_single_pipe/t_joint_points.shp"
 
 BUFFER_POINTS_TOUCHING = 0.02               # toleration for detecting touching lines
+SOURCES_POINTS_TOUCHING = 0.6
+CONSUMERS_POINTS_TOUCHING = 0.6
+
 ANGLE_DIFFERENCE_SIMPLIFY = 5               # simplify if angle difference less than 5 degrees
 ANGLE_DIFFERENT_DIRECTION = 5               # assume other direction if angle is bigger than ...
 SIMPLIFY_LINE_SEGMENTS = True               # simplify network by joining line segments that run in same direction
 SHAPEFILE_PIPE_DIAMETER_KEY = 'PIJPDIA'     # attribute name in the shapefile of the pipe diameter
 JOIN_PIPES_WITH_DIFFERENT_SIZE = False      # adds a 'adapter' joint when pipe diameter changes
+
+CREATE_CONS_PROD_WITH_IN_AND_OUT_PORT = True    # create ESDL consumer/producer with both InPort and OutPort
+
+
+def get_points(shapefile):
+    """
+    Creates a list of point items based on information coming from a shapefile
+
+    :param shapefile: points read from a shapefile
+    :return: dictionary of point items
+    """
+    points = dict()
+    for point_sh in shapefile:
+        point = shape(point_sh['geometry'])
+        point_id = point_sh['id']
+        points[point_id] = {
+            'id': point_id,
+            'shape': point,
+            'touching_pipe_points': list(),
+            'connected_to': list(),              # to administer connections
+            'ESDL_info': None
+        }
+
+    return points
 
 
 def get_line_segments(curve: LineString):
@@ -51,7 +95,7 @@ def get_split_lines(lines_shapefile):
     on information coming from a shapefile
 
     :param lines_shapefile: lines read from a shapefile
-    :return: list of line segments
+    :return: dictionary of line segments
     """
     lines = dict()
     for line_sh in lines_shapefile:
@@ -63,7 +107,8 @@ def get_split_lines(lines_shapefile):
                 'id': lid,
                 'shape': ls,
                 'line_sh': line_sh,
-                'points': list()
+                'points': list(),
+                'connected_to': ''      # producer or consumer
             }
 
     return lines
@@ -104,6 +149,7 @@ def split_line_segment_at_point(line_segment, p, points, lines):
         'shape': LineString([line_b_start_point['shape'].coords[0], line_segment['points'][1]['shape'].coords[0]]),
         'line_sh': line_segment['line_sh'],
         'points': [line_b_start_point, line_segment['points'][1]],
+        'connected_to': ''  # producer or consumer
     }
     line_b['points'][1]['line_id'] = line_b_id
 
@@ -203,7 +249,7 @@ def add_or_replace_points(res_line_points, p):
     res_line_points.append(p)
 
 
-def find_line(point, points, lines, res_lines, res_line, adapters):
+def find_line(point, points, lines, res_lines, res_line, adapters, point_to_res_line_dict):
     """
     Iterates over the line segments to constuct a connected line. Ends at either the line endpoint, or at a T joint
     location or optionally at a so-called 'adapter' (where line size changes) based on the value of
@@ -215,6 +261,7 @@ def find_line(point, points, lines, res_lines, res_line, adapters):
     :param res_lines: collection of detected 'connected' line segments
     :param res_line: start of to be constructed line
     :param adapters: collection of so-called 'adapters' that connect two pipe segments with different DN sizes
+    :param point_to_res_line_dict: dictionary that links points to res_lines
     :return: None
     """
     line = lines[point['line_id']]
@@ -231,11 +278,14 @@ def find_line(point, points, lines, res_lines, res_line, adapters):
     point['processed'] = True
     other_point['processed'] = True
 
+    line['belonging_to_res_line'] = res_line['id']
+
     number_of_intersected_points = len(other_point['intersecting_points'])
     if number_of_intersected_points == 0:
         # print(f"End of line reached - {other_point['t_joint_type']} - {len(res_line['points'])} points")
-        res_line['end'] = {'type': 'end point'}
-        res_lines.append(res_line)
+        res_line['end'] = {'type': 'end point', 'point_id': other_point['id']}
+        point_to_res_line_dict[other_point['id']] = res_line
+        res_lines[res_line['id']] = res_line
     elif number_of_intersected_points == 1:
         if not JOIN_PIPES_WITH_DIFFERENT_SIZE:
             current_pipe_diameter = line['line_sh']['properties'][SHAPEFILE_PIPE_DIAMETER_KEY]
@@ -246,25 +296,33 @@ def find_line(point, points, lines, res_lines, res_line, adapters):
                 adapter_nr = len(adapters) + 1
                 adapter = {'id': adapter_nr, 'shape': other_point['shape']}
                 adapters.append(adapter)
-                res_line['end'] = {'type': 'adapter', 'nr': adapter_nr}  # Pipe to pipe connection (with different sizes)
-                res_lines.append(res_line)
+                res_line['end'] = {'type': 'adapter', 'nr': adapter_nr, 'point_id': other_point['id']}  # Pipe to pipe connection (with different sizes)
+                point_to_res_line_dict[other_point['id']] = res_line
+                res_lines[res_line['id']] = res_line
                 res_line = {
+                    'id': str(uuid4()),
                     'points': [points[other_point['intersecting_points'][0]]['shape']],
-                    'start': {'type': 'adapter', 'nr': adapter_nr},
-                    'end': 0,
+                    'start': {
+                        'type': 'adapter',
+                        'nr': adapter_nr,
+                        'point_id': points[other_point['intersecting_points'][0]]['id'],
+                    },
+                    'end': None,
                     'diameter': next_pipe_diameter
                 }
-            find_line(points[other_point['intersecting_points'][0]], points, lines, res_lines, res_line, adapters)
+                point_to_res_line_dict[points[other_point['intersecting_points'][0]]['id']] = res_line
+            find_line(points[other_point['intersecting_points'][0]], points, lines, res_lines, res_line, adapters, point_to_res_line_dict)
         else:
-            find_line(points[other_point['intersecting_points'][0]], points, lines, res_lines, res_line, adapters)
+            find_line(points[other_point['intersecting_points'][0]], points, lines, res_lines, res_line, adapters, point_to_res_line_dict)
     elif number_of_intersected_points > 1:
         # print(f"Line ended at T-joint {other_point['t_joint_nr']} - {len(res_line['points'])} points")
-        res_line['end'] = {'type': 't-joint', 'nr': other_point['t_joint_nr']}
-        res_lines.append(res_line)
-        process_t_joint(other_point, points, lines, res_lines, adapters)
+        res_line['end'] = {'type': 't-joint', 'nr': other_point['t_joint_nr'], 'point_id': other_point['id']}
+        point_to_res_line_dict[other_point['id']] = res_line
+        res_lines[res_line['id']] = res_line
+        process_t_joint(other_point, points, lines, res_lines, adapters, point_to_res_line_dict)
 
 
-def process_t_joint(start_t_joint_point, points, lines, res_lines, adapters):
+def process_t_joint(start_t_joint_point, points, lines, res_lines, adapters, point_to_res_line_dict):
     """
     Processes a T joint location. Assumes the leg of start_t_joint_point has been processed already. Iterates over all
     connected line segments (that form the T joint) and starts discovering connected line segments that move away from
@@ -275,6 +333,7 @@ def process_t_joint(start_t_joint_point, points, lines, res_lines, adapters):
     :param lines: list of all line segments
     :param res_lines: collection of detected 'connected' line segments
     :param adapters: collection of so-called 'adapters' that connect two pipe segments with different DN sizes
+    :param point_to_res_line_dict: dictionary that links points to res_lines
     :return:
     """
     # print(start_point['t_joint_nr'])
@@ -285,15 +344,17 @@ def process_t_joint(start_t_joint_point, points, lines, res_lines, adapters):
             # start a new line of connected line segments with equal sizes
             pipe_diameter = lines[p['line_id']]['line_sh']['properties'][SHAPEFILE_PIPE_DIAMETER_KEY]
             res_line = {
+                'id': str(uuid4()),
                 'points': [p['shape']],
-                'start': {'type': 't-joint', 'nr': p['t_joint_nr']},
-                'end': 0,
+                'start': {'type': 't-joint', 'nr': p['t_joint_nr'], 'point_id': p['id']},
+                'end': None,
                 'diameter': pipe_diameter
             }
-            find_line(p, points, lines, res_lines, res_line, adapters)
+            point_to_res_line_dict[p['id']] = res_line
+            find_line(p, points, lines, res_lines, res_line, adapters, point_to_res_line_dict)
 
 
-def find_all_lines(start_t_joint_point, points, lines, res_lines, adapters):
+def find_all_lines(start_t_joint_point, points, lines, res_lines, adapters, point_to_res_line_dict):
     """
     Start of the algorithm to extract the topology information from the shapefile data. The algorithm starts at one of
     the t-joint locations in the network and traverses the network until all connected lines have been processed.
@@ -303,22 +364,29 @@ def find_all_lines(start_t_joint_point, points, lines, res_lines, adapters):
     :param lines: list of all line segments
     :param res_lines: collection of detected 'connected' line segments
     :param adapters: collection of so-called 'adapters' that connect two pipe segments with different DN sizes
+    :param point_to_res_line_dict: dictionary that links points to res_lines
     :return: None
     """
     if not start_t_joint_point['processed']:
         # process current/first 'leg' of the t-joint
         pipe_diameter = lines[start_t_joint_point['line_id']]['line_sh']['properties'][SHAPEFILE_PIPE_DIAMETER_KEY]
         res_line = {
+            'id': str(uuid4()),
             'points': [start_t_joint_point['shape']],
-            'start': {'type': 't-joint', 'nr': start_t_joint_point['t_joint_nr']},
-            'end': 0,
+            'start': {
+                'type': 't-joint',
+                'nr': start_t_joint_point['t_joint_nr'],
+                'point_id': start_t_joint_point['id'],
+            },
+            'end': None,
             'diameter': pipe_diameter
         }
+        point_to_res_line_dict[start_t_joint_point['id']] = res_line
         # iterate over all line segments until we find the end of this line (or a t-joint, or an adapter)
-        find_line(start_t_joint_point, points, lines, res_lines, res_line, adapters)
+        find_line(start_t_joint_point, points, lines, res_lines, res_line, adapters, point_to_res_line_dict)
 
-    # process t-joint (beasically the other 'legs')
-    process_t_joint(start_t_joint_point, points, lines, res_lines, adapters)
+    # process t-joint (basically the other 'legs')
+    process_t_joint(start_t_joint_point, points, lines, res_lines, adapters, point_to_res_line_dict)
 
 
 def check_points_lines(points, lines):
@@ -347,6 +415,41 @@ def check_points_lines(points, lines):
         assert(p in line['points'])
 
 
+def find_direction_of_connected_lines(res_line, point_to_res_line_dict):
+    # if res_line['start']['type'] == 't-joint':
+    #     start_point = t_joint_points[res_line['start']['nr'] - 1]['point']
+    # else:
+    #     start_point = points[res_line['start']['point_id']]
+    # if res_line['end']['type'] == 't-joint':
+    #     end_point = t_joint_points[res_line['end']['nr'] - 1]['point']
+    # else:
+    #     end_point = points[res_line['end']['point_id']]
+
+    if res_line['start']['type'] == 'adapter':
+        start_point = points[res_line['start']['point_id']]
+        connected_point = points[start_point['intersecting_points'][0]]     # adapter has only 1 intersecting point
+        connected_res_line = point_to_res_line_dict[connected_point['id']]
+        if 'direction' not in connected_res_line:
+            if connected_point['id'] == connected_res_line['start']['point_id']:
+                connected_res_line['direction'] = 'reversed' if res_line['direction'] == 'ok' else 'ok'
+            if connected_point['id'] == connected_res_line['end']['point_id']:
+                connected_res_line['direction'] = res_line['direction']
+            find_direction_of_connected_lines(connected_res_line, point_to_res_line_dict)
+
+    if res_line['end']['type'] == 'adapter':
+        end_point = points[res_line['end']['point_id']]
+        connected_point = points[end_point['intersecting_points'][0]]     # adapter has only 1 intersecting point
+        connected_res_line = point_to_res_line_dict[connected_point['id']]
+        if 'direction' not in connected_res_line:
+            if connected_point['id'] == connected_res_line['end']['point_id']:
+                print("end and end connected")
+                connected_res_line['direction'] = 'reversed' if res_line['direction'] == 'ok' else 'ok'
+            if connected_point['id'] == connected_res_line['start']['point_id']:
+                print("end and start connected")
+                connected_res_line['direction'] = res_line['direction']
+            find_direction_of_connected_lines(connected_res_line, point_to_res_line_dict)
+
+
 def add_joint_to_area(area, name, point_shape):
     """
     Adds an ESDL joint to an area with a given name and a given location
@@ -365,7 +468,36 @@ def add_joint_to_area(area, name, point_shape):
     return esdl_joint
 
 
+def add_consumer_to_area(area, name, point_shape):
+    consumer = esdl.HeatingDemand(id=str(uuid4()), name=name)
+    point_shp = Shape.transform_crs(Shape.create(point_shape), 'EPSG:28992')
+    consumer.geometry = point_shp.get_esdl()
+    consumer.port.append(esdl.InPort(id=str(uuid4()), name='InPort'))
+    consumer.port.append(esdl.OutPort(id=str(uuid4()), name='OutPort'))
+    area.asset.append(consumer)
+    return consumer
+
+
+def add_producer_to_area(area, name, point_shape):
+    producer = esdl.GenericProducer(id=str(uuid4()), name=name)
+    point_shp = Shape.transform_crs(Shape.create(point_shape), 'EPSG:28992')
+    producer.geometry = point_shp.get_esdl()
+    producer.port.append(esdl.InPort(id=str(uuid4()), name='InPort'))
+    producer.port.append(esdl.OutPort(id=str(uuid4()), name='OutPort'))
+    area.asset.append(producer)
+    return producer
+
+
 if __name__ == "__main__":
+    # =============================================================================================================
+    #  Read shapefiles with producers and consumers
+    # =============================================================================================================
+    print("=== Schema of shapefile")
+    producers_shapefile = fiona.open(SHAPEFILE_PRODUCERS_FILENAME)
+    producers_points = get_points(producers_shapefile)
+    consumers_shapefile = fiona.open(SHAPEFILE_CONSUMERS_FILENAME)
+    consumers_points = get_points(consumers_shapefile)
+
     # =============================================================================================================
     #  Read shapefile and build up list of line segments and list of points (end points of these line segments)
     # =============================================================================================================
@@ -384,31 +516,29 @@ if __name__ == "__main__":
     for lid, l in lines.items():
         line_shapely = l['shape']
         coords = line_shapely.coords
+        if len(coords) != 2:
+            raise Exception("Not all lines have been split into line segments")
         for pidx in range(len(coords)):
             pid = str(uuid4())
             point = {
                 'id': pid,
                 'shape': Point(coords[pidx]),
-                'type': 'middle',
+                'type': 'start' if pidx == 0 else 'end',
                 'line_id': lid,
                 'intersecting_points': list(),
                 't_joint_type': 'none',
                 't_joint_nr': 0,
                 'processed': False,
+                'touching_producers': list(),
+                'touching_consumers': list(),
             }
-            if pidx == 0:
-                point['type'] = 'start'
-            elif pidx == len(coords)-1:
-                point['type'] = 'end'
-            else:
-                raise Exception("Not all lines have been split into line segments")
             points[pid] = point
             l['points'].append(point)
 
     # =============================================================================================================
     #  Iterate through the list of points and find out which points are 'touching'
     # =============================================================================================================
-    print("=== Find 'touching' points")
+    print("=== Find 'touching' points of pipe segments")
     for pid1, p1 in points.items():
         for pid2, p2 in points.items():
             if pid1 != pid2:            # points are not the same
@@ -418,6 +548,50 @@ if __name__ == "__main__":
                         points[pid1]['intersecting_points'].append(pid2)
                     if pid1 not in points[pid2]['intersecting_points']:
                         points[pid2]['intersecting_points'].append(pid1)
+
+    # =============================================================================================================
+    #  Iterate through the list of points and find out which points are 'touching' producers and consumers
+    # =============================================================================================================
+    print("=== Find points that 'touch' producers and consumers")
+    for pid1, p1 in points.items():
+        for sid, s in producers_points.items():
+            if p1['shape'].distance(s['shape']) < SOURCES_POINTS_TOUCHING:
+                s['touching_pipe_points'].append(pid1)
+                points[pid1]['touching_producers'].append(sid)
+        for cid, c in consumers_points.items():
+            if p1['shape'].distance(c['shape']) < CONSUMERS_POINTS_TOUCHING:
+                c['touching_pipe_points'].append(pid1)
+                points[pid1]['touching_consumers'].append(cid)
+
+    # =============================================================================================================
+    #  Create shapefile for visualizing intermediate results
+    # =============================================================================================================
+    print("=== Create shapefile with buffers for determining connected producers and consumers")
+    schema = {
+        'geometry': 'Polygon',
+        'properties': {
+            'intersecting_points': 'int',
+            'type': 'str'
+        },
+    }
+    with fiona.open(BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME, 'w', crs=producers_shapefile.crs, driver=producers_shapefile.driver,
+                    schema=schema) as out_shapefile:
+        for pk, p in producers_points.items():
+            out_shapefile.write({
+                'geometry': mapping(p['shape'].buffer(SOURCES_POINTS_TOUCHING)),
+                'properties': {
+                    'intersecting_points': len(p['touching_pipe_points']),
+                    'type': 'source',
+                },
+            })
+        for pk, p in consumers_points.items():
+            out_shapefile.write({
+                'geometry': mapping(p['shape'].buffer(CONSUMERS_POINTS_TOUCHING)),
+                'properties': {
+                    'intersecting_points': len(p['touching_pipe_points']),
+                    'type': 'consumer',
+                },
+            })
 
     # =============================================================================================================
     #  Find T joint locations
@@ -482,7 +656,29 @@ if __name__ == "__main__":
         elif len(p['intersecting_points']) > 2:
             raise Exception("point has more than 2 intersecting points")
 
-    print(f"{len(t_joint_points)-num_t_joints_middle_of_line} t-joint locations found at end points of lines")
+    num_t_joints_end_of_line = len(t_joint_points)-num_t_joints_middle_of_line
+    print(f"{num_t_joints_end_of_line} t-joint locations found at end points of lines")
+
+    # print("=== Find points where consumers or producers connect at middle of line - add as T-joint")
+    # for pid, p in points.items():
+    #     # If point is at middle of line ...
+    #     if len(p['intersecting_points']) == 1:
+    #         # TODO: This goes wrong, adds T-joint for both touching points
+    #         # TODO: Or is consumer only touching 1 of the points?
+    #         # TODO: How does this work for networks with supply/return lines?
+    #         if p['touching_producers'] or p['touching_consumers']:
+    #             t_joint_nr = t_joint_nr + 1
+    #             p['t_joint_nr'] = t_joint_nr
+    #             p['t_joint_type'] = 'cons_prod_middle'
+    #             t_joint_points.append({
+    #                 'nr': t_joint_nr,
+    #                 'point': p,
+    #                 'shape': p['shape'],
+    #                 'intersecting_points': len(p['intersecting_points'])
+    #             })
+    #
+    # num_t_joints_cons_prod = len(t_joint_points)-num_t_joints_middle_of_line-num_t_joints_end_of_line
+    # print(f"{num_t_joints_cons_prod} t-joint locations found to connect consumers/producers at middle of line")
 
     # =============================================================================================================
     #  Create some shapefiles for visualizing intermediate results
@@ -527,13 +723,81 @@ if __name__ == "__main__":
     # =============================================================================================================
     #  Discover topology
     # =============================================================================================================
-    res_lines = list()
+    res_lines = dict()
     adapters = list()
+    point_to_res_line_dict = dict()
     for tjp in t_joint_points:
         # print(f"Start with joint {tjp['nr']} - {tjp['point']['t_joint_type']}:")
-        find_all_lines(tjp['point'], points, lines, res_lines, adapters)
+        find_all_lines(tjp['point'], points, lines, res_lines, adapters, point_to_res_line_dict)
 
     print(f"{len(res_lines)} pipes were generated from {len(lines)} shapefile pipe segments")
+
+    # =============================================================================================================
+    #  Mark lines coming from producers or going to consumers --> NOT REQUIRED, REMOVE?
+    # =============================================================================================================
+    # pipes_multipoint = MultiPoint([p['shape'] for pid, p in points.items()])  # TODO: split into different networks
+    # # create a dictionary where the key is the WKT of the point
+    # point_dict = {p['shape'].wkt: p for pid, p in points.items()}
+    #
+    # for cid, c in consumers_points.items():
+    #     loc = c['shape']
+    #     nearby_pipe_point = nearest_points(loc, pipes_multipoint)
+    #     # Original dataset uses 3D points...    convert such that 3D point can be used as a key in the dictionary
+    #     npp_3d = Point(nearby_pipe_point[1].coords[0][0], nearby_pipe_point[1].coords[0][1], 0)
+    #     # print(nearby_pipe_point[1].wkt)
+    #     point = point_dict[npp_3d.wkt]
+    #     line_id = point['line_id']
+    #     res_line_id = lines[line_id]['belonging_to_res_line']
+    #     res_line = res_lines[res_line_id]
+    #
+    #     print(res_line)
+
+    # =============================================================================================================
+    #  Mark direction of res lines based on coming from producers or going to consumers
+    # =============================================================================================================
+    for lid, l in res_lines.items():
+        if l['start']['type'] == 't-joint':
+            start_point = t_joint_points[l['start']['nr']-1]['point']
+        else:
+            start_point = points[l['start']['point_id']]
+        if l['end']['type'] == 't-joint':
+            end_point = t_joint_points[l['end']['nr']-1]['point']
+        else:
+            end_point = points[l['end']['point_id']]
+
+        print(start_point)
+        print(end_point)
+
+        if start_point['touching_producers']:
+            if 'direction' in l and l['direction'] != 'ok':
+                raise Exception("Conflicting directions - improve algorithm")
+            l['direction'] = 'ok'
+        if start_point['touching_consumers']:
+            if 'direction' in l and l['direction'] != 'reversed':
+                raise Exception("Conflicting directions - improve algorithm")
+            l['direction'] = 'reversed'
+        if end_point['touching_producers']:
+            if 'direction' in l and l['direction'] != 'reversed':
+                raise Exception("Conflicting directions - improve algorithm")
+            l['direction'] = 'reversed'
+        if end_point['touching_consumers']:
+            if 'direction' in l and l['direction'] != 'ok':
+                raise Exception("Conflicting directions - improve algorithm")
+            l['direction'] = 'ok'
+
+    print("before find_direction_of_connected_lines:")
+    for lid, l in res_lines.items():
+        direction = l['direction'] if 'direction' in l else ''
+        print(f"{lid}: {direction}")
+
+    for lid, l in res_lines.items():
+        if 'direction' in l:
+            find_direction_of_connected_lines(l, point_to_res_line_dict)
+
+    print("after find_direction_of_connected_lines:")
+    for lid, l in res_lines.items():
+        direction = l['direction'] if 'direction' in l else ''
+        print(f"{lid}: {direction}")
 
     # =============================================================================================================
     #  Create ESDL
@@ -543,12 +807,14 @@ if __name__ == "__main__":
     es = esh.create_empty_energy_system(name="shapefile test", es_description="", inst_title="instance", area_title="area")
     area = es.instance[0].area
 
-    for l in res_lines:
+    for lid, l in res_lines.items():
+        if 'direction' in l and l['direction'] == 'reversed':
+            l['points'].reverse()
         line_shape = LineString(l['points'])
         # print(f"Line from {l['start']} to {l['end']}: {line_shape}")
 
+        # transform CRS from 28992 to WGS84
         line_shp = Shape.transform_crs(Shape.create(line_shape), 'EPSG:28992')
-        # line_shp.transform_crs('EPSG:28992', from_crs='EPSG:4326')
 
         name = f"Pipe from {l['start']} to {l['end']} - {l['diameter']}"
         pipe = esdl.Pipe(id=str(uuid4()), name=name)
@@ -566,9 +832,11 @@ if __name__ == "__main__":
                 esdl_joint = add_joint_to_area(area, f"Joint {l['start']['nr']}", t_joint['shape'])
                 t_joint["ESDL_info"] = esdl_joint
 
-            pipe.port[0].connectedTo.append(esdl_joint.port[1])   # Pipe InPort <--> Joint OutPort
-
-        if l['start']['type'] == 'adapter':
+            if 'direction' in l and l['direction'] == 'reversed':
+                pipe.port[1].connectedTo.append(esdl_joint.port[0])   # Pipe OutPort <--> Joint InPort
+            else:
+                pipe.port[0].connectedTo.append(esdl_joint.port[1])   # Pipe InPort <--> Joint OutPort
+        elif l['start']['type'] == 'adapter':
             adapter = adapters[l['start']['nr']-1]
             if "ESDL_info" in adapter:
                 esdl_joint = adapter["ESDL_info"]
@@ -576,7 +844,30 @@ if __name__ == "__main__":
                 esdl_joint = add_joint_to_area(area, f"Joint {l['start']['nr']}", adapter['shape'])
                 adapter["ESDL_info"] = esdl_joint
 
-            pipe.port[0].connectedTo.append(esdl_joint.port[1])   # Pipe InPort <--> Joint OutPort
+            if 'direction' in l and l['direction'] == 'reversed':
+                pipe.port[1].connectedTo.append(esdl_joint.port[0])   # Pipe OutPort <--> Joint InPort
+            else:
+                pipe.port[0].connectedTo.append(esdl_joint.port[1])   # Pipe InPort <--> Joint OutPort
+        else:
+            # start of res_line is no adapter and no t-joint point
+            p = points[l['start']['point_id']]
+            for tc_id in p['touching_consumers']:
+                tc = consumers_points[tc_id]
+                esdl_consumer = add_consumer_to_area(area, f"Consumer", tc['shape'])
+
+                if 'direction' in l and l['direction'] == 'reversed':
+                    pipe.port[1].connectedTo.append(esdl_consumer.port[0])  # Pipe OutPort <--> Consumer InPort
+                else:
+                    raise Exception("start-consumer & line-direction:ok should not occur!")
+
+            for tp_id in p['touching_producers']:
+                tp = producers_points[tp_id]
+                esdl_producer = add_producer_to_area(area, f"Producer", tp['shape'])
+
+                if 'direction' in l and l['direction'] == 'reversed':
+                    raise Exception("start-producer & line-direction:reversed should not occur!")
+                else:
+                    pipe.port[0].connectedTo.append(esdl_producer.port[1])  # Pipe InPort <--> Producer OutPort
 
         if l['end']['type'] == 't-joint':
             t_joint = t_joint_points[l['end']['nr']-1]
@@ -586,9 +877,11 @@ if __name__ == "__main__":
                 esdl_joint = add_joint_to_area(area, f"Joint {l['end']['nr']}", t_joint['shape'])
                 t_joint["ESDL_info"] = esdl_joint
 
-            pipe.port[1].connectedTo.append(esdl_joint.port[0])   # Pipe OutPort <--> Joint InPort
-
-        if l['end']['type'] == 'adapter':
+            if 'direction' in l and l['direction'] == 'reversed':
+                pipe.port[0].connectedTo.append(esdl_joint.port[1])   # Pipe InPort <--> Joint OutPort
+            else:
+                pipe.port[1].connectedTo.append(esdl_joint.port[0])   # Pipe OutPort <--> Joint InPort
+        elif l['end']['type'] == 'adapter':
             adapter = adapters[l['end']['nr']-1]
             if "ESDL_info" in adapter:
                 esdl_joint = adapter["ESDL_info"]
@@ -596,7 +889,30 @@ if __name__ == "__main__":
                 esdl_joint = add_joint_to_area(area, f"Joint {l['end']['nr']}", adapter['shape'])
                 adapter["ESDL_info"] = esdl_joint
 
-            pipe.port[1].connectedTo.append(esdl_joint.port[0])   # Pipe OutPort <--> Joint InPort
+            if 'direction' in l and l['direction'] == 'reversed':
+                pipe.port[0].connectedTo.append(esdl_joint.port[1])   # Pipe InPort <--> Joint OutPort
+            else:
+                pipe.port[1].connectedTo.append(esdl_joint.port[0])   # Pipe OutPort <--> Joint InPort
+        else:
+            # end of res_line is no adapter and no t-joint point
+            p = points[l['end']['point_id']]
+            for tc_id in p['touching_consumers']:
+                tc = consumers_points[tc_id]
+                esdl_consumer = add_consumer_to_area(area, f"Consumer", tc['shape'])
+
+                if 'direction' in l and l['direction'] == 'reversed':
+                    raise Exception("end-consumer & line-direction:reversed should not occur!")
+                else:
+                    pipe.port[1].connectedTo.append(esdl_consumer.port[0])  # Pipe OutPort <--> Consumer InPort
+
+            for tp_id in p['touching_producers']:
+                tp = producers_points[tp_id]
+                esdl_producer = add_producer_to_area(area, f"Producer", tp['shape'])
+
+                if 'direction' in l and l['direction'] == 'reversed':
+                    pipe.port[0].connectedTo.append(esdl_producer.port[1])  # Pipe InPort <--> Producer OutPort
+                else:
+                    raise Exception("end-producer & line-direction:ok should not occur!")
 
     esh.save(ESDL_OUTPUT_FILENAME)
 
