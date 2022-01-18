@@ -15,12 +15,12 @@
 ######################################################################################################################
 # TODO:
 #
-# - Add a joint and split pipe if a consumer wants to connect to a pipe segment that is not the start/end of a pipe
+# v Add a joint and split pipe if a consumer wants to connect to a pipe segment that is not the start/end of a pipe
 # - Improve support for 2D/3D shapefiles (with and without Z coordinates)
-# - Improve importing exrta attributes from shapefiles (diameters, demand, names, ...)
+# v Improve importing exrta attributes from shapefiles (diameters, demand, names, ...)
 # - Handle consumer and producer connecting at same point
 # - Handle simple network without T-joints ??
-# - Check adapters that are T-joints ??
+# v Check adapters that are T-joints ??
 # - ...
 #
 ######################################################################################################################
