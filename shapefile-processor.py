@@ -12,19 +12,6 @@
 #  Manager:
 #      TNO
 
-######################################################################################################################
-# TODO:
-#
-# v Add a joint and split pipe if a consumer wants to connect to a pipe segment that is not the start/end of a pipe
-# - Improve support for 2D/3D shapefiles (with and without Z coordinates)
-# v Improve importing exrta attributes from shapefiles (diameters, demand, names, ...)
-# - Handle consumer and producer connecting at same point
-# - Handle simple network without T-joints ??
-# v Check adapters that are T-joints ??
-# - ...
-#
-######################################################################################################################
-
 from osgeo import gdal      # required by Fiona
 import fiona
 from shapely.geometry import shape, Point, LineString, mapping, MultiPoint
@@ -36,24 +23,39 @@ from esdl import esdl
 from esdl.esdl_handler import EnergySystemHandler
 from shape import Shape
 
-# SHAPEFILE_LINES_FILENAME = "data/simple_single_pipe/example_network.shp"
-# SHAPEFILE_PRODUCERS_FILENAME = "data/simple_single_pipe/sources.shp"
-# SHAPEFILE_CONSUMERS_FILENAME = "data/simple_single_pipe/consumers.shp"
-# ESDL_OUTPUT_FILENAME = "output/simple_single_pipe/network.esdl"
-# BUFFER_JOINTS_OUTPUT_FILENAME = "output/simple_single_pipe/points_buffer.shp"
-# BUFFER_PIPES_OUTPUT_FILENAME = "output/simple_single_pipe/pipes_point_buffer.shp"
-# BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME = "output/simple_single_pipe/producers_consumers_buffer.shp"
-# T_JOINTS_OUTPUT_FILENAME = "output/simple_single_pipe/t_joint_points.shp"
-# SHAPEFILE_PIPE_DIAMETER_KEY = 'PIJPDIA'     # attribute name in the shapefile of the pipe diameter
 
-SHAPEFILE_LINES_FILENAME = "data/RE/orig/pipe.shp"
-SHAPEFILE_PRODUCERS_FILENAME = "data/RE/orig/plant.shp"
-SHAPEFILE_CONSUMERS_FILENAME = "data/RE/orig/closeddemand.shp"
-ESDL_OUTPUT_FILENAME = "output/RE/network.esdl"
-BUFFER_JOINTS_OUTPUT_FILENAME = "output/RE/points_buffer.shp"
-BUFFER_PIPES_OUTPUT_FILENAME = "output/RE/pipes_point_buffer.shp"
-BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME = "output/RE/producers_consumers_buffer.shp"
-T_JOINTS_OUTPUT_FILENAME = "output/RE/t_joint_points.shp"
+######################################################################################################################
+# Settings for 1st example
+######################################################################################################################
+# SHAPEFILE_LINES_FILENAME = "input/Double pipe network/example_network.shp"
+# SHAPEFILE_PRODUCERS_FILENAME = None
+# SHAPEFILE_CONSUMERS_FILENAME = None
+# ESDL_OUTPUT_FILENAME = "output/Double pipe network/network.esdl"
+# BUFFER_JOINTS_OUTPUT_FILENAME = "debug_output/Double pipe network/points_buffer.shp"
+# BUFFER_PIPES_OUTPUT_FILENAME = "debug_output/Double pipe network/pipes_point_buffer.shp"
+# BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME = None
+# T_JOINTS_OUTPUT_FILENAME = "debug_output/Double pipe network/t_joint_points.shp"
+# SHAPEFILE_PIPE_DIAMETER_KEY = 'PIJPDIA'     # attribute name in the shapefile of the pipe diameter
+# SHAPEFILE_CONSUMERS_NAME_KEY = None
+# SHAPEFILE_CONSUMERS_SHORTNAME_KEY = None
+# SHAPEFILE_CONSUMERS_POWER_KEY = None
+# SHAPEFILE_CONSUMERS_POWER_MULTIPLIER = None
+# SHAPEFILE_PRODUCERS_NAME_KEY = None
+# SHAPEFILE_PRODUCERS_SHORTNAME_KEY = None
+# SHAPEFILE_PRODUCERS_POWER_KEY = None
+# SHAPEFILE_PRODUCERS_POWER_MULTIPLIER = None
+
+######################################################################################################################
+# Settings for 2nd example
+######################################################################################################################
+SHAPEFILE_LINES_FILENAME = "input/WNW/pipes.shp"
+SHAPEFILE_PRODUCERS_FILENAME = "input/WNW/producers.shp"
+SHAPEFILE_CONSUMERS_FILENAME = "input/WNW/consumers.shp"
+ESDL_OUTPUT_FILENAME = "output/WNW/network.esdl"
+BUFFER_JOINTS_OUTPUT_FILENAME = "debug_output/WNW/points_buffer.shp"
+BUFFER_PIPES_OUTPUT_FILENAME = "debug_output/WNW/pipes_point_buffer.shp"
+BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME = "debug_output/WNW/producers_consumers_buffer.shp"
+T_JOINTS_OUTPUT_FILENAME = "debug_output/WNW/t_joint_points.shp"
 SHAPEFILE_PIPE_DIAMETER_KEY = 'material'     # attribute name in the shapefile of the pipe diameter
 SHAPEFILE_CONSUMERS_NAME_KEY = 'descript1'
 SHAPEFILE_CONSUMERS_SHORTNAME_KEY = ''
@@ -573,12 +575,18 @@ if __name__ == "__main__":
     #  Read shapefiles with producers and consumers
     # =============================================================================================================
     print("=== Schema of shapefile")
-    producers_shapefile = fiona.open(SHAPEFILE_PRODUCERS_FILENAME)
-    producers_points = get_points(producers_shapefile)
-    consumers_shapefile = fiona.open(SHAPEFILE_CONSUMERS_FILENAME)
-    consumers_points = get_points(consumers_shapefile)
+    producers_shapefile = None
+    producers_points = dict()
+    consumers_shapefile = None
+    consumers_points = dict()
+    if SHAPEFILE_PRODUCERS_FILENAME:
+        producers_shapefile = fiona.open(SHAPEFILE_PRODUCERS_FILENAME)
+        producers_points = get_points(producers_shapefile)
+    if SHAPEFILE_CONSUMERS_FILENAME:
+        consumers_shapefile = fiona.open(SHAPEFILE_CONSUMERS_FILENAME)
+        consumers_points = get_points(consumers_shapefile)
 
-    # =============================================================================================================
+        # =============================================================================================================
     #  Read shapefile and build up list of line segments and list of points (end points of these line segments)
     # =============================================================================================================
     print("=== Schema of shapefile")
@@ -628,20 +636,6 @@ if __name__ == "__main__":
                         points[pid1]['intersecting_points'].append(pid2)
                     if pid1 not in points[pid2]['intersecting_points']:
                         points[pid2]['intersecting_points'].append(pid1)
-
-    # =============================================================================================================
-    #  Iterate through the list of points and find out which points are 'touching' producers and consumers
-    # =============================================================================================================
-    # print("=== Find points that 'touch' producers and consumers")
-    # for pid1, p1 in points.items():
-    #     for sid, s in producers_points.items():
-    #         if p1['shape'].distance(s['shape']) < SOURCES_POINTS_TOUCHING:
-    #             s['touching_pipe_points'].append(pid1)
-    #             points[pid1]['touching_producers'].append(sid)
-    #     for cid, c in consumers_points.items():
-    #         if p1['shape'].distance(c['shape']) < CONSUMERS_POINTS_TOUCHING:
-    #             c['touching_pipe_points'].append(pid1)
-    #             points[pid1]['touching_consumers'].append(cid)
 
     # =============================================================================================================
     #  Find closest pipe points for all producers and consumers
@@ -703,24 +697,25 @@ if __name__ == "__main__":
             'type': 'str'
         },
     }
-    with fiona.open(BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME, 'w', crs=producers_shapefile.crs, driver=producers_shapefile.driver,
-                    schema=schema) as out_shapefile:
-        for pk, p in producers_points.items():
-            out_shapefile.write({
-                'geometry': mapping(p['shape'].buffer(SOURCES_POINTS_TOUCHING)),
-                'properties': {
-                    'intersecting_points': len(p['touching_pipe_points']),
-                    'type': 'source',
-                },
-            })
-        for pk, p in consumers_points.items():
-            out_shapefile.write({
-                'geometry': mapping(p['shape'].buffer(CONSUMERS_POINTS_TOUCHING)),
-                'properties': {
-                    'intersecting_points': len(p['touching_pipe_points']),
-                    'type': 'consumer',
-                },
-            })
+    if producers_shapefile:
+        with fiona.open(BUFFER_SOURCES_CONSUMERS_OUTPUT_FILENAME, 'w', crs=producers_shapefile.crs, driver=producers_shapefile.driver,
+                        schema=schema) as out_shapefile:
+            for pk, p in producers_points.items():
+                out_shapefile.write({
+                    'geometry': mapping(p['shape'].buffer(SOURCES_POINTS_TOUCHING)),
+                    'properties': {
+                        'intersecting_points': len(p['touching_pipe_points']),
+                        'type': 'source',
+                    },
+                })
+            for pk, p in consumers_points.items():
+                out_shapefile.write({
+                    'geometry': mapping(p['shape'].buffer(CONSUMERS_POINTS_TOUCHING)),
+                    'properties': {
+                        'intersecting_points': len(p['touching_pipe_points']),
+                        'type': 'consumer',
+                    },
+                })
 
     # =============================================================================================================
     #  Find T joint locations
@@ -821,27 +816,6 @@ if __name__ == "__main__":
     num_t_joints_end_of_line = len(t_joint_points)-num_t_joints_middle_of_line-num_t_joints_cons_prod
     print(f"{num_t_joints_end_of_line} t-joint locations found at end points of lines")
 
-    # print("=== Find points where consumers or producers connect at middle of line - add as T-joint")
-    # for pid, p in points.items():
-    #     # If point is at middle of line ...
-    #     if len(p['intersecting_points']) == 1:
-    #         # TODO: This goes wrong, adds T-joint for both touching points
-    #         # TODO: Or is consumer only touching 1 of the points?
-    #         # TODO: How does this work for networks with supply/return lines?
-    #         if p['touching_producers'] or p['touching_consumers']:
-    #             t_joint_nr = t_joint_nr + 1
-    #             p['t_joint_nr'] = t_joint_nr
-    #             p['t_joint_type'] = 'cons_prod_middle'
-    #             t_joint_points.append({
-    #                 'nr': t_joint_nr,
-    #                 'point': p,
-    #                 'shape': p['shape'],
-    #                 'intersecting_points': len(p['intersecting_points'])
-    #             })
-    #
-    # num_t_joints_cons_prod = len(t_joint_points)-num_t_joints_middle_of_line-num_t_joints_end_of_line
-    # print(f"{num_t_joints_cons_prod} t-joint locations found to connect consumers/producers at middle of line")
-
     # =============================================================================================================
     #  Create some shapefiles for visualizing intermediate results
     # =============================================================================================================
@@ -907,9 +881,6 @@ if __name__ == "__main__":
         else:
             end_point = points[l['end']['point_id']]
 
-        print(start_point)
-        print(end_point)
-
         if start_point['touching_producers']:
             # if 'direction' in l and l['direction'] != 'ok':
             #     raise Exception("Conflicting directions - improve algorithm")
@@ -931,7 +902,6 @@ if __name__ == "__main__":
             if not end_point['intersecting_points']:
                 l['direction'] = 'ok'
 
-    print("")
     num_directions_set = 0
     for lid, l in res_lines.items():
         direction = l['direction'] if 'direction' in l else ''
@@ -944,7 +914,6 @@ if __name__ == "__main__":
         if 'direction' in l:
             find_direction_of_connected_lines(l, point_to_res_line_dict)
 
-    print("")
     num_directions_set = 0
     for lid, l in res_lines.items():
         direction = l['direction'] if 'direction' in l else ''
@@ -1074,4 +1043,3 @@ if __name__ == "__main__":
                     raise Exception("end-producer & line-direction:ok should not occur!")
 
     esh.save(ESDL_OUTPUT_FILENAME)
-
