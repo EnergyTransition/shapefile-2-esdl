@@ -47,6 +47,13 @@ python shapefile-processor.py
 The repository contains an example shapefile from a small part of a Vattenfall district heating network.
 
 
+## Note
+
+* For now, the script assumes shapefiles in RD coordinates (EPSG:28992). Therefore the length of a pipe (or cable)
+  can be estimated using the Shapely length function (which implements a Euclidean distance calculation). For other
+  projections this needs to be improved.  
+
+
 ## Two examples
 
 # Example 1: Part of a district heating network in Ede (Vattenfall)

@@ -945,6 +945,8 @@ if __name__ == "__main__":
         pipe.port.append(esdl.InPort(id=str(uuid4()), name='InPort'))
         pipe.port.append(esdl.OutPort(id=str(uuid4()), name='OutPort'))
         pipe.diameter = esdl.PipeDiameterEnum.from_string(l['diameter'])
+        # Assume RD coordinates (EPSG:28992) that does a fairly accurate length determination
+        pipe.length = line_shape.length
         area.asset.append(pipe)
 
         # Add esdl.Joint (if required) and connect Pipe
